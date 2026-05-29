@@ -152,6 +152,7 @@ const syncContacts = async (req, res, next) => {
 
     // Extract phone numbers and normalize
     const phones = contacts.map((c) => c.phone.trim());
+    console.log(`[syncContacts] Received ${phones.length} phones. Sample: ${phones.slice(0, 5).join(', ')}`);
 
     // Find all registered users matching those phones
     const registeredUsers = await User.find({
@@ -160,6 +161,15 @@ const syncContacts = async (req, res, next) => {
     })
       .select('phone name avatarUrl')
       .lean();
+
+    console.log(`[syncContacts] DB match: ${registeredUsers.length} registered users found.`);
+    if (registeredUsers.length > 0) {
+      console.log(`[syncContacts] Sample: ${registeredUsers.slice(0, 3).map(u => u.phone).join(', ')}`);
+    }
+
+    // DEBUG: show all registered phones in DB (first 10)
+    const sampleDB = await User.find({ isDeleted: false }).select('phone').limit(10).lean();
+    console.log(`[syncContacts] DB sample users: ${sampleDB.map(u => u.phone).join(', ')}`);
 
     const registeredPhoneSet = new Set(registeredUsers.map((u) => u.phone));
 
