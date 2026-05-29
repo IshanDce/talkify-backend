@@ -36,15 +36,6 @@ const getProfile = async (req, res, next) => {
  * Accepted image types: jpg, jpeg, png, gif, webp, bmp, svg
  * Maximum file size: 5 MB
  */
-const ALLOWED_IMAGE_TYPES = [
-  'image/jpeg',
-  'image/png',
-  'image/gif',
-  'image/webp',
-  'image/bmp',
-  'image/svg+xml',
-];
-
 const updateProfile = async (req, res, next) => {
   let uploadedImageKitFileId = null;
 
@@ -58,11 +49,11 @@ const updateProfile = async (req, res, next) => {
 
     // --- Handle avatar image upload to ImageKit ---
     if (avatarFile) {
-      // Validate MIME type
-      if (!ALLOWED_IMAGE_TYPES.includes(avatarFile.mimetype)) {
+      // Validate MIME type (accepts any image/* — multer already pre-filters)
+      if (!avatarFile.mimetype || !avatarFile.mimetype.startsWith('image/')) {
         throw createError(
           400,
-          `Invalid image type: ${avatarFile.mimetype}. Allowed: jpg, jpeg, png, gif, webp, bmp, svg`
+          `Invalid image type: ${avatarFile.mimetype}. Please upload a valid image file.`
         );
       }
 

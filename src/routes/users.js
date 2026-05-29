@@ -12,18 +12,11 @@ const upload = multer({
     fileSize: 5 * 1024 * 1024, // 5 MB
   },
   fileFilter: (_req, file, cb) => {
-    const allowedMimes = [
-      'image/jpeg',
-      'image/png',
-      'image/gif',
-      'image/webp',
-      'image/bmp',
-      'image/svg+xml',
-    ];
-    if (allowedMimes.includes(file.mimetype)) {
+    // Accept any image/* MIME type (jpg, jpeg, png, gif, webp, bmp, svg, etc.)
+    if (file.mimetype && file.mimetype.startsWith('image/')) {
       cb(null, true);
     } else {
-      cb(new Error('Invalid image type. Allowed: jpg, jpeg, png, gif, webp, bmp, svg'), false);
+      cb(new Error('Invalid image type. Please upload a valid image file (jpg, png, gif, webp, etc.)'), false);
     }
   },
 });
