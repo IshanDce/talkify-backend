@@ -134,6 +134,37 @@ const updateProfile = async (req, res, next) => {
  * POST /api/users/sync-contacts
  * Accepts an array of phone contacts, returns registered and unregistered splits.
  */
+/**
+ * Normalize a phone number to E.164 format.
+ * Mirrors the Flutter _normalizePhone logic exactly so that
+ * numbers from device contacts always match DB-stored numbers.
+ *
+ * Examples:
+ *   '8076574242'       → '+918076574242'
+ *   '08076574242'      → '+918076574242'
+ *   '+91 8076574242'   → '+918076574242'
+ *   '918076574242'     → '+918076574242'
+ *   '+918076574242'    → '+918076574242'
+ */
+const normalizePhone = (raw) => {
+  if (!raw || typeof raw !== 'string') return '';
+  // Strip ALL non-digit characters (spaces, dashes, parens, plus sign)
+  let digits = raw.replace(/\D/g, '');
+  if (!digits) return '';
+  // Remove leading 0 if present (common in Indian contacts: 08076574242)
+  if (digits.length > 10 && digits.startsWith('0')) {
+    digits = digits.substring(1);
+  }
+  // 10 digits = Indian local number → add +91
+  if (digits.length === 10) return `+91${digits}`;
+  // 12 digits starting with 91 = Indian with country code → add +
+  if (digits.length === 12 && digits.startsWith('91')) return `+${digits}`;
+  // Any other length > 10 → just add +
+  if (digits.length > 10) return `+${digits}`;
+  // Fallback (short numbers, etc.)
+  return `+${digits}`;
+};
+
 const syncContacts = async (req, res, next) => {
   try {
     const { contacts } = req.body;
@@ -150,9 +181,19 @@ const syncContacts = async (req, res, next) => {
       throw createError(400, 'Maximum 1000 contacts per request');
     }
 
-    // Extract phone numbers and normalize
-    const phones = contacts.map((c) => c.phone.trim());
+    // Normalize all incoming phone numbers using E.164 normalization
+    // (same logic as Flutter's _normalizePhone)
+    const normalizedContacts = contacts.map((c) => ({
+      ...c,
+      phone: normalizePhone(c.phone),
+    }));
+
+    const phones = normalizedContacts.map((c) => c.phone).filter(Boolean);
     console.log(`[syncContacts] Received ${phones.length} phones. Sample: ${phones.slice(0, 5).join(', ')}`);
+
+    // Get the current user's phone to exclude from results
+    const currentUserPhone = req.user.phone;
+    console.log(`[syncContacts] Current user phone: ${currentUserPhone}`);
 
     // Find all registered users matching those phones
     const registeredUsers = await User.find({
@@ -171,29 +212,42 @@ const syncContacts = async (req, res, next) => {
     const sampleDB = await User.find({ isDeleted: false }).select('phone').limit(10).lean();
     console.log(`[syncContacts] DB sample users: ${sampleDB.map(u => u.phone).join(', ')}`);
 
-    const registeredPhoneSet = new Set(registeredUsers.map((u) => u.phone));
+    // Build a map from phone → talkify user for O(1) lookup
+    const registeredPhoneMap = new Map();
+    for (const u of registeredUsers) {
+      registeredPhoneMap.set(u.phone, u);
+    }
 
-    // Map registered users with their local contact name
-    const registeredResult = contacts
-      .filter((c) => registeredPhoneSet.has(c.phone.trim()))
-      .map((c) => {
-        const talkifyUser = registeredUsers.find((u) => u.phone === c.phone.trim());
-        return {
+    // Map registered users with their local contact name,
+    // excluding the current user's own phone number
+    const registeredResult = [];
+    const unregisteredResult = [];
+
+    for (const c of normalizedContacts) {
+      if (!c.phone) continue;
+
+      const talkifyUser = registeredPhoneMap.get(c.phone);
+
+      if (talkifyUser) {
+        // Skip the current user (don't show yourself in the contact list)
+        if (c.phone === currentUserPhone) continue;
+
+        registeredResult.push({
           phone: c.phone,
           id: talkifyUser._id,
           talkifyName: talkifyUser.name || '',
           localName: c.name || '',
           avatarUrl: talkifyUser.avatarUrl || '',
-        };
-      });
+        });
+      } else {
+        unregisteredResult.push({
+          phone: c.phone,
+          localName: c.name || '',
+        });
+      }
+    }
 
-    // Unregistered contacts
-    const unregisteredResult = contacts
-      .filter((c) => !registeredPhoneSet.has(c.phone.trim()))
-      .map((c) => ({
-        phone: c.phone,
-        localName: c.name || '',
-      }));
+    console.log(`[syncContacts] Result: ${registeredResult.length} registered (excl. self), ${unregisteredResult.length} unregistered`);
 
     res.status(200).json({
       registeredUsers: registeredResult,
