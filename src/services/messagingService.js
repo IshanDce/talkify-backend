@@ -1,0 +1,182 @@
+const Chat = require('../models/Chat');
+const Message = require('../models/Message');
+const User = require('../models/User');
+const { createError } = require('../middleware/errorHandler');
+
+/**
+ * GET /api/chats
+ * Returns the list of conversations for the authenticated user.
+ */
+const getChats = async (req, res, next) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+
+    const chats = await Chat.find({
+      participants: req.user.userId,
+    })
+      .sort({ updatedAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit, 10))
+      .populate('participants', 'name phone avatarUrl status lastSeen')
+      .populate('lastMessage.messageId')
+      .lean();
+
+    const total = await Chat.countDocuments({ participants: req.user.userId });
+
+    // Transform response to match API spec
+    const chatList = chats.map((chat) => {
+      const otherParticipants = chat.participants.filter(
+        (p) => p._id.toString() !== req.user.userId
+      );
+
+      const unreadEntry = chat.unreadCounts?.find(
+        (uc) => uc.userId?.toString() === req.user.userId
+      );
+
+      return {
+        chatId: chat._id,
+        isGroup: chat.isGroup,
+        groupName: chat.groupName || null,
+        groupAvatarUrl: chat.groupAvatarUrl || null,
+        participant: chat.isGroup ? null : otherParticipants[0] || null,
+        participants: chat.isGroup ? chat.participants : null,
+        lastMessage: chat.lastMessage?.messageId
+          ? {
+              id: chat.lastMessage.messageId._id,
+              content: chat.lastMessage.content,
+              type: chat.lastMessage.type,
+              senderId: chat.lastMessage.senderId,
+              timestamp: chat.lastMessage.timestamp,
+            }
+          : null,
+        unreadCount: unreadEntry?.count || 0,
+      };
+    });
+
+    res.status(200).json({
+      chats: chatList,
+      pagination: {
+        page: parseInt(page, 10),
+        limit: parseInt(limit, 10),
+        total,
+        pages: Math.ceil(total / parseInt(limit, 10)),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /api/chats/:chatId/messages
+ * Returns paginated historical messages for a specific chat.
+ */
+const getMessages = async (req, res, next) => {
+  try {
+    const { chatId } = req.params;
+    const { before, limit = 50 } = req.query;
+
+    // Verify user is a participant of this chat
+    const chat = await Chat.findOne({
+      _id: chatId,
+      participants: req.user.userId,
+    }).lean();
+
+    if (!chat) {
+      throw createError(403, 'You are not a participant of this chat');
+    }
+
+    // Build query
+    const query = { chatId, isDeleted: false };
+    if (before) {
+      query.createdAt = { $lt: new Date(before) };
+    }
+
+    const messages = await Message.find(query)
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit, 10))
+      .populate('senderId', 'name avatarUrl phone')
+      .lean();
+
+    const total = await Message.countDocuments({ chatId, isDeleted: false });
+
+    res.status(200).json({
+      messages: messages.reverse().map((msg) => ({
+        id: msg._id,
+        senderId: msg.senderId._id,
+        senderName: msg.senderId.name,
+        senderAvatar: msg.senderId.avatarUrl,
+        type: msg.type,
+        content: msg.content,
+        media: msg.media || null,
+        replyTo: msg.replyTo || null,
+        timestamp: msg.createdAt,
+        status: msg.status,
+      })),
+      pagination: {
+        before: before || null,
+        limit: parseInt(limit, 10),
+        total,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/chats/group
+ * Creates a new group chat.
+ */
+const createGroup = async (req, res, next) => {
+  try {
+    const { name, participants, avatarUrl } = req.body;
+
+    if (!name || !name.trim()) {
+      throw createError(400, 'Group name is required');
+    }
+
+    if (!participants || !Array.isArray(participants) || participants.length < 1) {
+      throw createError(400, 'At least one participant is required');
+    }
+
+    // Ensure the creator is included
+    const allParticipants = [...new Set([req.user.userId, ...participants])];
+
+    if (allParticipants.length < 2) {
+      throw createError(400, 'Group must have at least 2 participants (including you)');
+    }
+
+    if (allParticipants.length > 256) {
+      throw createError(400, 'Maximum 256 participants allowed');
+    }
+
+    // Verify all participant IDs exist
+    const validUsers = await User.find({
+      _id: { $in: allParticipants },
+      isDeleted: false,
+    }).select('_id');
+
+    if (validUsers.length !== allParticipants.length) {
+      throw createError(400, 'One or more participants are invalid');
+    }
+
+    const chat = await Chat.create({
+      isGroup: true,
+      groupName: name.trim(),
+      groupAvatarUrl: avatarUrl || '',
+      groupAdmin: req.user.userId,
+      participants: allParticipants,
+      unreadCounts: allParticipants.map((p) => ({ userId: p, count: 0 })),
+    });
+
+    res.status(201).json({
+      chatId: chat._id,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { getChats, getMessages, createGroup };

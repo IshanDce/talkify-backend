@@ -1,0 +1,278 @@
+const config = require('../config');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
+const User = require('../models/User');
+const { createError } = require('../middleware/errorHandler');
+
+/**
+ * Generate a 6-digit OTP and hash it for storage.
+ * In dev mode (useRealApi=false): always returns 123456 for easy testing
+ * In real mode: generates a random 6-digit OTP
+ */
+const generateOtp = () => {
+  if (!config.msg91.useRealApi) {
+    return { otp: '123456', otpHash: bcrypt.hashSync('123456', 10) };
+  }
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const otpHash = bcrypt.hashSync(otp, 10);
+  return { otp, otpHash };
+};
+
+/**
+ * Send OTP via Msg91 v5 Flow API (when useRealApi=true) or dev mode local print.
+ * The Flow API sends an SMS using a pre-approved DLT template and passes the OTP
+ * as a variable (VAR1). Msg91 auto-generates and verifies the OTP on its side.
+ */
+const sendMsg91OTP = async (phone, otp) => {
+  if (!config.msg91.useRealApi) {
+    console.log(`[DEV OTP] Phone: ${phone}, OTP: ${otp}`);
+    return { referenceId: `dev_ref_${uuidv4().slice(0, 8)}` };
+  }
+
+  try {
+    // Use the Flow API (v5/flow) which sends SMS via approved DLT templates
+    const url = 'https://api.msg91.com/api/v5/flow/';
+    const mobile = phone.replace('+', ''); // +919876543210 → 919876543210
+
+    const payload = {
+      template_id: config.msg91.templateId,
+      sender: config.msg91.senderId,
+      short_url: '0', // disabled
+      mobiles: mobile,
+      // The OTP variable name depends on your DLT template — common names: VAR1, otp, OTP
+      VAR1: otp,
+    };
+
+    console.log('[Msg91] Sending Flow API request:', { ...payload, VAR1: '******' });
+
+    const response = await axios.post(url, payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        authkey: config.msg91.authKey,
+      },
+    });
+
+    console.log('[Msg91] Flow API response:', JSON.stringify(response.data));
+
+    // Flow API returns { type: "success", request_id: "..." } on success
+    if (response.data.type === 'error') {
+      throw createError(502, response.data.message || 'Msg91 Flow API returned an error');
+    }
+
+    return { referenceId: response.data.request_id || response.data.type };
+  } catch (error) {
+    if (error.statusCode) throw error;
+    console.error('[Msg91] Failed to send OTP:', error.response?.data || error.message);
+    throw createError(502, 'Failed to send OTP via SMS. Please try again.');
+  }
+};
+
+/**
+ * Verify OTP: uses Msg91 verify API when useRealApi=true, else compares local bcrypt hash.
+ */
+const verifyMsg91OTP = async (phone, otp, referenceId, storedOtpHash) => {
+  if (!config.msg91.useRealApi) {
+    // Dev mode: compare with stored bcrypt hash
+    const isValid = bcrypt.compareSync(otp, storedOtpHash || '');
+    if (!isValid) throw createError(400, 'Invalid OTP');
+    return true;
+  }
+
+  try {
+    const url = `https://api.msg91.com/api/v5/otp/verify`;
+    const response = await axios.post(
+      url,
+      {
+        mobile: phone.replace('+', ''),
+        otp,
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'authkey': config.msg91.authKey,
+        },
+      }
+    );
+
+    console.log('[Msg91] OTP verify response:', response.data);
+
+    if (response.data.type !== 'success') {
+      throw createError(400, response.data.message || 'Invalid or expired OTP');
+    }
+    return true;
+  } catch (error) {
+    if (error.statusCode) throw error;
+    console.error('[Msg91] OTP verification failed:', error.response?.data || error.message);
+    throw createError(502, 'OTP verification service unavailable. Please try again.');
+  }
+};
+
+/**
+ * Generate JWT access and refresh tokens.
+ */
+const generateTokens = (user) => {
+  const payload = { userId: user._id.toString(), phone: user.phone };
+
+  const accessToken = jwt.sign(payload, config.jwt.accessSecret, {
+    expiresIn: config.jwt.accessExpiry,
+  });
+
+  const refreshToken = jwt.sign(payload, config.jwt.refreshSecret, {
+    expiresIn: config.jwt.refreshExpiry,
+  });
+
+  return { accessToken, refreshToken };
+};
+
+// =============================================================================
+// Controller Methods
+// =============================================================================
+
+/**
+ * POST /api/auth/send-otp
+ */
+const sendOtp = async (req, res, next) => {
+  try {
+    const { phone } = req.body;
+
+    if (!phone || !/^\+\d{10,15}$/.test(phone)) {
+      throw createError(400, 'Valid phone number with country code is required (e.g. +919876543210)');
+    }
+
+    // Find or create user placeholder
+    let user = await User.findOne({ phone, isDeleted: false });
+    if (!user) {
+      user = new User({ phone });
+    }
+    // Keep user in DB but not fully registered until OTP verified
+
+    const { otp, otpHash } = generateOtp();
+    const { referenceId } = await sendMsg91OTP(phone, otp);
+
+    // Store OTP hash with expiry
+    user.otpHash = otpHash;
+    user.otpExpiresAt = new Date(Date.now() + config.msg91.otpExpiryMinutes * 60 * 1000);
+    user.otpReferenceId = referenceId;
+    await user.save();
+
+    res.status(200).json({
+      message: 'OTP sent successfully',
+      referenceId,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/auth/verify-otp
+ */
+const verifyOtp = async (req, res, next) => {
+  try {
+    const { phone, otp, fcmToken } = req.body;
+
+    if (!phone || !otp) {
+      throw createError(400, 'Phone and OTP are required');
+    }
+
+    const user = await User.findOne({ phone, isDeleted: false });
+    if (!user) {
+      throw createError(404, 'User not found. Please request OTP first.');
+    }
+
+    // Check OTP expiry
+    if (user.otpExpiresAt && new Date() > user.otpExpiresAt) {
+      throw createError(400, 'OTP has expired. Please request a new one.');
+    }
+
+    // Verify OTP
+    await verifyMsg91OTP(phone, otp, user.otpReferenceId, user.otpHash);
+
+    const isNewUser = !user.name; // New user if name hasn't been set
+
+    // Clear OTP fields
+    user.otpHash = null;
+    user.otpExpiresAt = null;
+    user.otpReferenceId = null;
+
+    // Store FCM token if provided
+    if (fcmToken) {
+      const existingTokenIndex = user.fcmTokens.findIndex((t) => t.token === fcmToken);
+      if (existingTokenIndex >= 0) {
+        user.fcmTokens[existingTokenIndex].updatedAt = new Date();
+      } else {
+        user.fcmTokens.push({ token: fcmToken, device: 'mobile', updatedAt: new Date() });
+        // Keep only last 5 tokens
+        if (user.fcmTokens.length > 5) {
+          user.fcmTokens = user.fcmTokens.slice(-5);
+        }
+      }
+    }
+
+    // Generate tokens
+    const { accessToken, refreshToken } = generateTokens(user);
+    user.refreshToken = refreshToken;
+    await user.save();
+
+    res.status(200).json({
+      accessToken,
+      refreshToken,
+      user: {
+        id: user._id,
+        phone: user.phone,
+        name: user.name,
+        avatarUrl: user.avatarUrl,
+        bio: user.bio,
+        isNewUser,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /api/auth/refresh
+ */
+const refreshToken = async (req, res, next) => {
+  try {
+    const { refreshToken: token } = req.body;
+
+    if (!token) {
+      throw createError(400, 'Refresh token is required');
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, config.jwt.refreshSecret);
+    } catch (err) {
+      throw createError(401, 'Invalid or expired refresh token');
+    }
+
+    const user = await User.findById(decoded.userId);
+    if (!user || user.isDeleted) {
+      throw createError(401, 'User not found');
+    }
+
+    // Validate stored refresh token
+    if (user.refreshToken !== token) {
+      throw createError(401, 'Refresh token has been revoked');
+    }
+
+    // Generate new token pair
+    const tokens = generateTokens(user);
+    user.refreshToken = tokens.refreshToken;
+    await user.save();
+
+    res.status(200).json({
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { sendOtp, verifyOtp, refreshToken };
