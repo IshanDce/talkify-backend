@@ -1,5 +1,7 @@
 const User = require('../models/User');
 const { createError } = require('../middleware/errorHandler');
+const { getImageKit } = require('../config/imagekit');
+const path = require('path');
 
 /**
  * GET /api/users/profile
@@ -27,15 +29,76 @@ const getProfile = async (req, res, next) => {
 
 /**
  * PUT /api/users/profile
+ * Accepts: multipart/form-data
+ * Fields: name (text), bio (text)
+ * File:   avatar (image file)
+ *
+ * Accepted image types: jpg, jpeg, png, gif, webp, bmp, svg
+ * Maximum file size: 5 MB
  */
+const ALLOWED_IMAGE_TYPES = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'image/bmp',
+  'image/svg+xml',
+];
+
 const updateProfile = async (req, res, next) => {
+  let uploadedImageKitFileId = null;
+
   try {
-    const { name, avatarUrl, bio } = req.body;
+    const { name, bio } = req.body;
+    const avatarFile = req.file; // Provided by multer middleware (memoryStorage)
 
     const updates = {};
-    if (name !== undefined) updates.name = name;
-    if (avatarUrl !== undefined) updates.avatarUrl = avatarUrl;
-    if (bio !== undefined) updates.bio = bio;
+    if (name !== undefined && name !== '') updates.name = name;
+    if (bio !== undefined && bio !== '') updates.bio = bio;
+
+    // --- Handle avatar image upload to ImageKit ---
+    if (avatarFile) {
+      // Validate MIME type
+      if (!ALLOWED_IMAGE_TYPES.includes(avatarFile.mimetype)) {
+        throw createError(
+          400,
+          `Invalid image type: ${avatarFile.mimetype}. Allowed: jpg, jpeg, png, gif, webp, bmp, svg`
+        );
+      }
+
+      const imagekit = getImageKit();
+      if (!imagekit) {
+        throw createError(503, 'Media service is not configured');
+      }
+
+      // Upload directly from memory buffer (no disk I/O)
+      const ext = path.extname(avatarFile.originalname) || '.jpg';
+      const uploadResponse = await imagekit.upload({
+        file: avatarFile.buffer,
+        fileName: `avatar_${req.user.userId}_${Date.now()}${ext}`,
+        folder: '/talkify/avatars/',
+        useUniqueFileName: true,
+      });
+
+      uploadedImageKitFileId = uploadResponse.fileId;
+      updates.avatarUrl = uploadResponse.url;
+
+      // --- Delete old avatar from ImageKit if it exists ---
+      const currentUser = await User.findById(req.user.userId).select('avatarUrl').lean();
+      if (currentUser && currentUser.avatarUrl) {
+        try {
+          const existingFiles = await imagekit.listFiles({
+            searchQuery: `url="${currentUser.avatarUrl}"`,
+          });
+          if (existingFiles && existingFiles.length > 0) {
+            await imagekit.deleteFile(existingFiles[0].fileId);
+          }
+        } catch (deleteErr) {
+          // Non-critical: log and continue
+          console.warn('[userService] Failed to delete old avatar:', deleteErr.message);
+        }
+      }
+    }
 
     if (Object.keys(updates).length === 0) {
       throw createError(400, 'No valid fields to update');
@@ -61,6 +124,17 @@ const updateProfile = async (req, res, next) => {
       },
     });
   } catch (err) {
+    // If we uploaded to ImageKit but DB update failed, delete the uploaded image
+    if (uploadedImageKitFileId) {
+      try {
+        const imagekit = getImageKit();
+        if (imagekit) {
+          await imagekit.deleteFile(uploadedImageKitFileId);
+        }
+      } catch (_) {
+        // ignore
+      }
+    }
     next(err);
   }
 };

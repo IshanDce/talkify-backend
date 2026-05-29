@@ -84,6 +84,28 @@ app.use('/api/media', mediaRoutes);
 app.use('/api/calls', callRoutes);
 
 // =========================================================================
+// Multer Error Handler (must be AFTER routes)
+// =========================================================================
+app.use((err, req, res, next) => {
+  if (err && err.name === 'MulterError') {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File size exceeds 5 MB limit' });
+    }
+    if (err.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({ error: 'Too many files uploaded' });
+    }
+    if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({ error: `Unexpected file field: ${err.field}` });
+    }
+    return res.status(400).json({ error: err.message });
+  }
+  if (err && err.message && err.message.startsWith('Invalid image type')) {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
+});
+
+// =========================================================================
 // 404 Handler
 // =========================================================================
 app.use((_req, res) => {
