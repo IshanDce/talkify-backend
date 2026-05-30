@@ -4,6 +4,82 @@ const User = require('../models/User');
 const { createError } = require('../middleware/errorHandler');
 
 /**
+ * Helper: Find or create a 1-on-1 chat between two users.
+ * Returns the chat document (Mongoose object, not lean).
+ */
+const findOrCreateDirectChat = async (userId1, userId2) => {
+  // Ensure consistent ordering so we always find the same chat
+  const [idA, idB] = [userId1, userId2].sort();
+
+  let chat = await Chat.findOne({
+    isGroup: false,
+    participants: { $all: [idA, idB], $size: 2 },
+  });
+
+  if (!chat) {
+    chat = await Chat.create({
+      isGroup: false,
+      participants: [idA, idB],
+      unreadCounts: [
+        { userId: idA, count: 0 },
+        { userId: idB, count: 0 },
+      ],
+    });
+  }
+
+  return chat;
+};
+
+/**
+ * POST /api/chats/direct
+ * Find or create a 1-on-1 chat between the authenticated user and a peer.
+ */
+const getOrCreateDirectChat = async (req, res, next) => {
+  try {
+    const { peerId } = req.body;
+
+    if (!peerId || typeof peerId !== 'string' || !peerId.trim()) {
+      throw createError(400, 'peerId is required');
+    }
+
+    // Prevent creating a chat with yourself
+    if (peerId === req.user.userId) {
+      throw createError(400, 'Cannot create a chat with yourself');
+    }
+
+    // Verify peer exists
+    const peer = await User.findById(peerId).select('_id').lean();
+    if (!peer) {
+      throw createError(404, 'User not found');
+    }
+
+    const chat = await findOrCreateDirectChat(req.user.userId, peerId);
+    await chat.populate('participants', 'name phone avatarUrl status lastSeen');
+
+    const otherParticipant = chat.participants.find(
+      (p) => p._id.toString() !== req.user.userId
+    );
+
+    res.status(200).json({
+      chatId: chat._id,
+      isGroup: chat.isGroup,
+      participant: otherParticipant
+        ? {
+            id: otherParticipant._id,
+            name: otherParticipant.name,
+            phone: otherParticipant.phone,
+            avatarUrl: otherParticipant.avatarUrl,
+            status: otherParticipant.status,
+            lastSeen: otherParticipant.lastSeen,
+          }
+        : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
  * GET /api/chats
  * Returns the list of conversations for the authenticated user.
  */
@@ -179,4 +255,4 @@ const createGroup = async (req, res, next) => {
   }
 };
 
-module.exports = { getChats, getMessages, createGroup };
+module.exports = { getOrCreateDirectChat, getChats, getMessages, createGroup };

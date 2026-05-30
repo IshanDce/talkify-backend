@@ -1,4 +1,5 @@
 const User = require('../models/User');
+const Chat = require('../models/Chat');
 const { createError } = require('../middleware/errorHandler');
 const { getImageKit } = require('../config/imagekit');
 const path = require('path');
@@ -219,9 +220,41 @@ const syncContacts = async (req, res, next) => {
     }
 
     // Map registered users with their local contact name,
-    // excluding the current user's own phone number
+    // excluding the current user's own phone number.
+    //
+    // Also fetch existing direct chats so the Flutter app knows which
+    // chatId to open without needing a separate API call.
     const registeredResult = [];
     const unregisteredResult = [];
+
+    const registeredUserIds = [];
+    for (const c of normalizedContacts) {
+      if (!c.phone) continue;
+      const talkifyUser = registeredPhoneMap.get(c.phone);
+      if (talkifyUser && c.phone !== currentUserPhone) {
+        registeredUserIds.push(talkifyUser._id);
+      }
+    }
+
+    // Fetch ALL direct (1-on-1) chats the current user participates in.
+    // We filter in-memory since per-user direct chat counts are typically low.
+    const existingChats = await Chat.find({
+      isGroup: false,
+      participants: req.user.userId,
+    }).lean();
+
+    // Build a map: contactUserId -> chatId
+    const chatIdMap = new Map();
+    for (const chat of existingChats) {
+      // Only consider 2-person chats (safety check)
+      if (chat.participants.length !== 2) continue;
+      for (const pId of chat.participants) {
+        const pidStr = pId.toString();
+        if (pidStr !== req.user.userId) {
+          chatIdMap.set(pidStr, chat._id.toString());
+        }
+      }
+    }
 
     for (const c of normalizedContacts) {
       if (!c.phone) continue;
@@ -232,9 +265,11 @@ const syncContacts = async (req, res, next) => {
         // Skip the current user (don't show yourself in the contact list)
         if (c.phone === currentUserPhone) continue;
 
+        const uid = talkifyUser._id.toString();
         registeredResult.push({
           phone: c.phone,
           id: talkifyUser._id,
+          chatId: chatIdMap.get(uid) || '',
           talkifyName: talkifyUser.name || '',
           localName: c.name || '',
           avatarUrl: talkifyUser.avatarUrl || '',

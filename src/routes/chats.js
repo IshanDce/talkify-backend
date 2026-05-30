@@ -1,6 +1,6 @@
 const { Router } = require('express');
 const authenticate = require('../middleware/auth');
-const { getChats, getMessages, createGroup } = require('../services/messagingService');
+const { getOrCreateDirectChat, getChats, getMessages, createGroup } = require('../services/messagingService');
 
 const router = Router();
 
@@ -9,6 +9,7 @@ router.use(authenticate);
 
 router.get('/', getChats);
 router.get('/:chatId/messages', getMessages);
+router.post('/direct', getOrCreateDirectChat);
 router.post('/group', createGroup);
 
 module.exports = router;
