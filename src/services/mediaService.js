@@ -1,3 +1,4 @@
+const config = require('../config');
 const { getImageKit } = require('../config/imagekit');
 const { createError } = require('../middleware/errorHandler');
 const { v4: uuidv4 } = require('uuid');
@@ -17,9 +18,11 @@ const getAuthParams = async (req, res, next) => {
     const authParams = imagekit.getAuthenticationParameters();
 
     res.status(200).json({
+      publicKey: config.imagekit.publicKey,
       token: authParams.token,
       expire: authParams.expire,
       signature: authParams.signature,
+      urlEndpoint: config.imagekit.urlEndpoint,
     });
   } catch (err) {
     next(err);
