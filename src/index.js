@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const compression = require('compression');
 
 const config = require('./config');
 const connectDB = require('./config/database');
@@ -31,6 +32,19 @@ const server = http.createServer(app);
 // Security headers
 app.use(helmet());
 
+// Compression middleware for faster transfers
+app.use(compression({
+  filter: (req, res) => {
+    // Don't compress if the request is for file upload
+    if (req.path === '/api/media/upload') {
+      return false;
+    }
+    return compression.filter(req, res);
+  },
+  level: 6, // Balanced compression level
+  threshold: 1024, // Only compress responses larger than 1KB
+}));
+
 // CORS
 app.use(
   cors({
@@ -44,6 +58,10 @@ app.use(
 // Body parsing
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// Increase limits for media uploads specifically
+app.use('/api/media/upload', express.json({ limit: '100mb' }));
+app.use('/api/media/upload', express.urlencoded({ extended: true, limit: '100mb' }));
 
 // Request logging
 if (config.nodeEnv === 'development') {
@@ -89,7 +107,7 @@ app.use('/api/calls', callRoutes);
 app.use((err, req, res, next) => {
   if (err && err.name === 'MulterError') {
     if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File size exceeds 5 MB limit' });
+      return res.status(400).json({ error: 'File size exceeds 100 MB limit' });
     }
     if (err.code === 'LIMIT_FILE_COUNT') {
       return res.status(400).json({ error: 'Too many files uploaded' });

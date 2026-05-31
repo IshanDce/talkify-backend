@@ -2,7 +2,7 @@ const { Router } = require('express');
 const multer = require('multer');
 const path = require('path');
 const authenticate = require('../middleware/auth');
-const { getAuthParams, uploadMedia, deleteMedia } = require('../services/mediaService');
+const { getAuthParams, uploadMedia, deleteMedia, uploadChunked, completeChunkedUpload } = require('../services/mediaService');
 
 const router = Router();
 
@@ -15,7 +15,8 @@ const ALLOWED_MEDIA_EXTENSIONS = new Set([
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50 MB
+    fileSize: 100 * 1024 * 1024, // 100 MB for videos
+    fieldSize: 100 * 1024 * 1024, // 100 MB field size
   },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype && (file.mimetype.startsWith('image/') || file.mimetype.startsWith('video/'))) {
@@ -31,11 +32,21 @@ const upload = multer({
   },
 });
 
+// Chunked upload configuration for very large files
+const chunkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10 MB per chunk
+  },
+});
+
 // All media routes require authentication
 router.use(authenticate);
 
 router.get('/auth', getAuthParams);
 router.post('/upload', upload.single('file'), uploadMedia);
+router.post('/upload-chunk', chunkUpload.single('chunk'), uploadChunked);
+router.post('/upload-complete', completeChunkedUpload);
 router.delete('/delete', deleteMedia);
 
 module.exports = router;
