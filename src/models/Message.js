@@ -40,6 +40,20 @@ const messageSchema = new mongoose.Schema(
       ref: 'Message',
       default: null,
     },
+    // Emoji reactions from chat participants
+    reactions: [
+      {
+        userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        emoji: { type: String },
+        createdAt: { type: Date, default: Date.now },
+      },
+    ],
+    // Set when a message was forwarded from another chat
+    forwardedFrom: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Message',
+      default: null,
+    },
     status: {
       type: String,
       enum: ['sent', 'delivered', 'read'],

@@ -187,6 +187,11 @@ const getMessages = async (req, res, next) => {
         content: msg.content,
         media: msg.media || null,
         replyTo: msg.replyTo || null,
+        forwardedFrom: msg.forwardedFrom || null,
+        reactions: (msg.reactions || []).map((r) => ({
+          userId: r.userId?.toString(),
+          emoji: r.emoji,
+        })),
         timestamp: msg.createdAt,
         status: msg.status,
       })),
@@ -255,4 +260,100 @@ const createGroup = async (req, res, next) => {
   }
 };
 
-module.exports = { getOrCreateDirectChat, getChats, getMessages, createGroup };
+/**
+ * GET /api/chats/search?q=...
+ * Searches the authenticated user's chats: message text matches plus chat /
+ * group name matches. Returns a flat list of results with a content snippet.
+ */
+const searchMessages = async (req, res, next) => {
+  try {
+    const q = (req.query.q || '').toString().trim();
+    if (q.length < 1) {
+      return res.status(200).json({ results: [] });
+    }
+
+    // Escape regex special chars from the user query
+    const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(safe, 'i');
+
+    // Only search within chats the user participates in
+    const chats = await Chat.find({ participants: req.user.userId })
+      .select('_id isGroup groupName groupAvatarUrl participants')
+      .populate('participants', 'name avatarUrl')
+      .lean();
+
+    const chatIds = chats.map((c) => c._id);
+    const chatById = new Map(chats.map((c) => [c._id.toString(), c]));
+
+    // Matching messages (most recent first, capped)
+    const messages = await Message.find({
+      chatId: { $in: chatIds },
+      isDeleted: false,
+      type: 'text',
+      content: regex,
+    })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .populate('senderId', 'name avatarUrl')
+      .lean();
+
+    const buildChatMeta = (chat) => {
+      if (chat.isGroup) {
+        return {
+          name: chat.groupName || 'Group',
+          avatarUrl: chat.groupAvatarUrl || '',
+          isGroup: true,
+        };
+      }
+      const other = chat.participants.find(
+        (p) => p._id.toString() !== req.user.userId
+      );
+      return {
+        name: other?.name || 'Unknown',
+        avatarUrl: other?.avatarUrl || '',
+        isGroup: false,
+      };
+    };
+
+    const messageResults = messages.map((m) => {
+      const chat = chatById.get(m.chatId.toString());
+      const meta = chat ? buildChatMeta(chat) : { name: '', avatarUrl: '', isGroup: false };
+      return {
+        kind: 'message',
+        chatId: m.chatId,
+        messageId: m._id,
+        snippet: m.content,
+        senderName: m.senderId?.name || '',
+        timestamp: m.createdAt,
+        chatName: meta.name,
+        chatAvatarUrl: meta.avatarUrl,
+        isGroup: meta.isGroup,
+      };
+    });
+
+    // Matching chats/groups by name
+    const chatResults = chats
+      .filter((c) => {
+        const meta = buildChatMeta(c);
+        return regex.test(meta.name);
+      })
+      .map((c) => {
+        const meta = buildChatMeta(c);
+        return {
+          kind: 'chat',
+          chatId: c._id,
+          chatName: meta.name,
+          chatAvatarUrl: meta.avatarUrl,
+          isGroup: meta.isGroup,
+        };
+      });
+
+    res.status(200).json({
+      results: [...chatResults, ...messageResults],
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { getOrCreateDirectChat, getChats, getMessages, createGroup, searchMessages };

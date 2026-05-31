@@ -70,6 +70,10 @@ const initSocketIO = (server) => {
     // Broadcast online status to all contacts
     await broadcastStatus(io, userId, 'online');
 
+    // Catch-up delivery: mark messages that arrived while this user was
+    // offline as 'delivered' and notify their senders (grey double-tick).
+    await deliverPendingMessages(io, userId);
+
     // =======================================================================
     // Event: user:status:poll (client requests status of a contact)
     // =======================================================================
@@ -94,7 +98,7 @@ const initSocketIO = (server) => {
     // =======================================================================
     socket.on('message:send', async (data) => {
       try {
-        const { chatId, type = 'text', content, tempId, media } = data;
+        const { chatId, type = 'text', content, tempId, media, forwardedFrom } = data;
 
         // Verify chat exists and user is participant
         const chat = await Chat.findOne({
@@ -117,6 +121,7 @@ const initSocketIO = (server) => {
           type,
           content: content || '',
           media: media || null,
+          forwardedFrom: forwardedFrom || null,
           status: 'sent',
           deliveredTo: [],
           readBy: [],
@@ -171,6 +176,8 @@ const initSocketIO = (server) => {
           type: populatedMessage.type,
           content: populatedMessage.content,
           media: populatedMessage.media,
+          forwardedFrom: populatedMessage.forwardedFrom || null,
+          reactions: [],
           timestamp: populatedMessage.createdAt,
         };
 
@@ -188,6 +195,17 @@ const initSocketIO = (server) => {
               },
               status: 'delivered',
             });
+            // Notify the sender that the message was delivered (grey double-tick)
+            const senderSockets = connectedUsers.get(userId);
+            if (senderSockets) {
+              for (const sockId of senderSockets) {
+                io.to(sockId).emit('message:delivered', {
+                  chatId,
+                  messageId: message._id,
+                  deliveredTo: recipientId,
+                });
+              }
+            }
           } else {
             // Recipient is offline - send push notification
             const recipientUser = chat.participants.find(
@@ -284,6 +302,62 @@ const initSocketIO = (server) => {
     });
 
     // =======================================================================
+    // Event: message:react (toggle an emoji reaction on a message)
+    // =======================================================================
+    socket.on('message:react', async (data) => {
+      try {
+        const { messageId, emoji } = data;
+        if (!messageId || !emoji) return;
+
+        const message = await Message.findById(messageId);
+        if (!message) return;
+
+        // Verify the user participates in this chat
+        const chat = await Chat.findOne({
+          _id: message.chatId,
+          participants: userId,
+        }).select('participants').lean();
+        if (!chat) return;
+
+        // Toggle: same user + same emoji removes; otherwise replace this
+        // user's existing reaction with the new emoji.
+        const existingIdx = message.reactions.findIndex(
+          (r) => r.userId?.toString() === userId
+        );
+        if (existingIdx >= 0 && message.reactions[existingIdx].emoji === emoji) {
+          message.reactions.splice(existingIdx, 1);
+        } else if (existingIdx >= 0) {
+          message.reactions[existingIdx].emoji = emoji;
+          message.reactions[existingIdx].createdAt = new Date();
+        } else {
+          message.reactions.push({ userId, emoji, createdAt: new Date() });
+        }
+        await message.save();
+
+        const reactionsPayload = message.reactions.map((r) => ({
+          userId: r.userId?.toString(),
+          emoji: r.emoji,
+        }));
+
+        // Broadcast the updated reactions to every participant
+        for (const participantId of chat.participants.map((p) => p.toString())) {
+          const sockets = connectedUsers.get(participantId);
+          if (sockets) {
+            for (const sockId of sockets) {
+              io.to(sockId).emit('message:reaction:update', {
+                chatId: message.chatId,
+                messageId: message._id,
+                reactions: reactionsPayload,
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[Socket] message:react error:', err.message);
+      }
+    });
+
+    // =======================================================================
     // Event: chat:typing
     // =======================================================================
     socket.on('chat:typing', (data) => {
@@ -345,6 +419,7 @@ const initSocketIO = (server) => {
         const callPayload = {
           callId: callLog._id,
           channelName,
+          callType,
           caller: {
             id: userId,
             name: caller?.name || '',
@@ -354,22 +429,142 @@ const initSocketIO = (server) => {
 
         const targetSockets = connectedUsers.get(targetUserId);
         if (targetSockets && targetSockets.size > 0) {
-          // Target is online - ring them
+          // Target is online - ring them via socket
           for (const sockId of targetSockets) {
             io.to(sockId).emit('call:incoming', callPayload);
           }
-        } else {
-          // Target is offline - send FCM push
-          await notifyIncomingCall(
-            targetUser,
-            caller?.name || '',
-            callLog._id,
-            channelName
-          );
         }
+        // Always also send a push so a backgrounded/terminated app shows the
+        // native incoming-call UI. The client de-dupes by callId.
+        await notifyIncomingCall(
+          targetUser,
+          caller?.name || '',
+          callLog._id,
+          channelName,
+          {
+            callerId: userId,
+            callerAvatar: caller?.avatarUrl || '',
+            callType,
+          }
+        );
       } catch (err) {
         console.error('[Socket] call:initiate error:', err.message);
         socket.emit('call:error', { error: 'Failed to initiate call' });
+      }
+    });
+
+    // =======================================================================
+    // Event: call:group:initiate (ring all other members of a group chat)
+    // =======================================================================
+    socket.on('call:group:initiate', async (data) => {
+      try {
+        const { chatId, channelName, callType = 'audio' } = data;
+
+        const chat = await Chat.findOne({
+          _id: chatId,
+          participants: userId,
+          isGroup: true,
+        }).populate('participants', 'name avatarUrl fcmTokens').lean();
+
+        if (!chat) {
+          socket.emit('call:error', { error: 'Group not found' });
+          return;
+        }
+
+        const caller = chat.participants.find(
+          (p) => p._id.toString() === userId
+        );
+
+        const callLog = await CallLog.create({
+          callerId: userId,
+          chatId,
+          isGroup: true,
+          participants: [userId],
+          channelName,
+          callType,
+          status: 'outgoing',
+          startedAt: new Date(),
+        });
+
+        const callPayload = {
+          callId: callLog._id,
+          channelName,
+          callType,
+          isGroup: true,
+          chatId,
+          groupName: chat.groupName || 'Group',
+          caller: {
+            id: userId,
+            name: caller?.name || '',
+            avatarUrl: caller?.avatarUrl || '',
+          },
+        };
+
+        const others = chat.participants.filter(
+          (p) => p._id.toString() !== userId
+        );
+
+        for (const member of others) {
+          const memberId = member._id.toString();
+          const memberSockets = connectedUsers.get(memberId);
+          if (memberSockets && memberSockets.size > 0) {
+            for (const sockId of memberSockets) {
+              io.to(sockId).emit('call:incoming', callPayload);
+            }
+          }
+          // Also push so backgrounded members ring
+          await notifyIncomingCall(
+            member,
+            caller?.name || '',
+            callLog._id,
+            channelName,
+            {
+              callerId: userId,
+              callerAvatar: caller?.avatarUrl || '',
+              callType,
+              isGroup: true,
+              chatId,
+              groupName: chat.groupName || 'Group',
+            }
+          );
+        }
+      } catch (err) {
+        console.error('[Socket] call:group:initiate error:', err.message);
+        socket.emit('call:error', { error: 'Failed to initiate group call' });
+      }
+    });
+
+    // =======================================================================
+    // Event: call:group:join / call:group:leave (track membership)
+    // =======================================================================
+    socket.on('call:group:join', async (data) => {
+      try {
+        const { callId } = data;
+        if (!callId) return;
+        await CallLog.findByIdAndUpdate(callId, {
+          $addToSet: { participants: userId },
+        });
+      } catch (err) {
+        console.error('[Socket] call:group:join error:', err.message);
+      }
+    });
+
+    socket.on('call:group:leave', async (data) => {
+      try {
+        const { callId } = data;
+        if (!callId) return;
+        const callLog = await CallLog.findById(callId);
+        if (!callLog) return;
+        callLog.participants = callLog.participants.filter(
+          (p) => p.toString() !== userId
+        );
+        // When the last participant leaves, close the call out.
+        if (callLog.participants.length === 0 && !callLog.endedAt) {
+          callLog.endedAt = new Date();
+        }
+        await callLog.save();
+      } catch (err) {
+        console.error('[Socket] call:group:leave error:', err.message);
       }
     });
 
@@ -486,6 +681,56 @@ const initSocketIO = (server) => {
 const isUserOnline = (userId) => {
   const sockets = connectedUsers.get(userId);
   return sockets && sockets.size > 0;
+};
+
+// ===========================================================================
+// Helper: Mark messages delivered to a freshly-connected user and notify
+// their senders so the sender's UI updates to the grey double-tick.
+// ===========================================================================
+const deliverPendingMessages = async (io, userId) => {
+  try {
+    // Chats this user participates in
+    const chats = await Chat.find({ participants: userId }).select('_id').lean();
+    const chatIds = chats.map((c) => c._id);
+    if (chatIds.length === 0) return;
+
+    // Messages sent by others, still 'sent', not yet delivered to this user
+    const pending = await Message.find({
+      chatId: { $in: chatIds },
+      senderId: { $ne: userId },
+      status: 'sent',
+      'deliveredTo.userId': { $ne: userId },
+    })
+      .select('_id chatId senderId')
+      .lean();
+
+    if (pending.length === 0) return;
+
+    const now = new Date();
+    await Message.updateMany(
+      { _id: { $in: pending.map((m) => m._id) } },
+      {
+        status: 'delivered',
+        $addToSet: { deliveredTo: { userId, deliveredAt: now } },
+      }
+    );
+
+    // Notify each original sender that their message was delivered
+    for (const msg of pending) {
+      const senderSockets = connectedUsers.get(msg.senderId.toString());
+      if (senderSockets) {
+        for (const sockId of senderSockets) {
+          io.to(sockId).emit('message:delivered', {
+            chatId: msg.chatId,
+            messageId: msg._id,
+            deliveredTo: userId,
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Socket] deliverPendingMessages error:', err.message);
+  }
 };
 
 // ===========================================================================

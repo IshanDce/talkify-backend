@@ -10,8 +10,25 @@ const callLogSchema = new mongoose.Schema(
     calleeId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
-      required: true,
+      default: null,
     },
+    // Set for group calls — references the group chat being called.
+    chatId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Chat',
+      default: null,
+    },
+    isGroup: {
+      type: Boolean,
+      default: false,
+    },
+    // Participants invited to / joined in a group call.
+    participants: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
+    ],
     channelName: {
       type: String,
       required: true,

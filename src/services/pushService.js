@@ -100,22 +100,67 @@ const notifyNewMessage = async (recipientUser, senderName, chatId, messageConten
 };
 
 /**
- * Send an incoming call notification to an offline user.
+ * Send an incoming call notification. Uses a DATA-ONLY, high-priority message
+ * (no `notification` block) so the Flutter background handler always runs and
+ * can show the native CallKit / full-screen incoming-call UI.
  */
-const notifyIncomingCall = async (recipientUser, callerName, callId, channelName) => {
+const notifyIncomingCall = async (
+  recipientUser,
+  callerName,
+  callId,
+  channelName,
+  extra = {}
+) => {
   const fcmTokens = recipientUser.fcmTokens?.map((t) => t.token) || [];
   if (fcmTokens.length === 0) return;
 
-  return sendPushNotification(fcmTokens, {
-    title: callerName || 'Talkify',
-    body: 'Incoming audio call...',
+  const firebase = getFirebase();
+  if (!firebase) {
+    console.warn('[FCM] Firebase not initialized. Skipping call push.');
+    return null;
+  }
+
+  const uniqueTokens = [...new Set(fcmTokens)];
+  const message = {
     data: {
       type: 'incoming_call',
       callId: callId.toString(),
-      channelName,
+      channelName: channelName || '',
       callerName: callerName || '',
+      callerId: (extra.callerId || '').toString(),
+      callerAvatar: extra.callerAvatar || '',
+      callType: extra.callType || 'audio',
+      isGroup: extra.isGroup ? 'true' : 'false',
+      chatId: (extra.chatId || '').toString(),
+      groupName: extra.groupName || '',
     },
-  });
+    tokens: uniqueTokens,
+    android: {
+      priority: 'high',
+    },
+    apns: {
+      headers: {
+        'apns-priority': '10',
+        'apns-push-type': 'voip',
+      },
+      payload: {
+        aps: {
+          contentAvailable: true,
+        },
+      },
+    },
+  };
+
+  try {
+    const response = await firebase.messaging().sendEachForMulticast(message);
+    console.log(
+      `[FCM] Call push sent: ${response.successCount} ok, ${response.failureCount} failed`
+    );
+    return response;
+  } catch (error) {
+    console.error('[FCM] Call push error:', error.message);
+    return null;
+  }
 };
 
 /**
